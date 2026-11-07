@@ -1,0 +1,60 @@
+name: visual-gate
+title: Visual Gate
+version: 1.0.0
+manifest_version: 2
+api_version: 1
+description: >-
+  Visual regression and accessibility gate for web UI work. Screenshots a page through a real
+  Chrome, diffs it against a stored baseline with anti-flake pixel alignment, reports the exact
+  changed regions, and audits the same page for WCAG 2.2 AA violations including computed
+  colour-contrast ratios. One tool returns PASS/FAIL plus a self-contained HTML report with the
+  side-by-side, the highlighted diff and every violation pinned to its CSS selector. Catches the
+  breakage an agent introduces when it edits CSS or markup, which no assertion in a test suite sees.
+author: salch-cred
+license: MIT
+homepage: https://github.com/salch-cred/visual-gate
+tags: [testing, visual-regression, accessibility, wcag, browser, qa, css]
+requires_hermes: ">=0.23"
+category: tools
+
+provides_tools:
+  - vg_capture
+  - vg_diff
+  - vg_a11y
+  - vg_gate
+  - vg_baselines
+  - vg_doctor
+
+config_schema:
+  chrome_path:
+    type: str
+    default: ""
+    description: Absolute path to a Chrome/Edge/Chromium binary. Empty auto-detects the usual install locations.
+  threshold:
+    type: int
+    default: 12
+    description: Per-channel difference (0-255) a pixel must exceed to count as changed. Raised above font antialiasing noise.
+  tolerance:
+    type: float
+    default: 0.001
+    description: Fraction of changed pixels allowed before a diff fails the gate.
+  align:
+    type: bool
+    default: true
+    description: Search a small pixel offset before diffing so sub-pixel layout jitter does not read as a change.
+  contrast_aa:
+    type: float
+    default: 4.5
+    description: WCAG AA contrast ratio required for normal-size text.
+  max_text_nodes:
+    type: int
+    default: 400
+    description: Cap on elements sampled by the contrast check, largest first.
+  keep_shots:
+    type: int
+    default: 40
+    description: How many captured screenshots per baseline to retain on disk.
+
+python_dependencies:
+  - "Pillow>=10.0,<13"
+  - "numpy>=1.24,<3"
