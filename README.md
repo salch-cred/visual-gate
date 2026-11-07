@@ -24,6 +24,27 @@ It exists because nothing else sees what the agent broke: a unit test can't tell
 
 **The differentiator:** the accessibility engine is a real probe that runs inside the page and returns *computed* contrast ratios — full alpha compositing over every ancestor background, not a colour pallet guess. The a11y tooling exists in 1,063 catalog entries and essentially none of them compute it against the real DOM.
 
+### A real run (measured, self-hosted harness)
+
+```text
+$ python demo_harness.py
+[2] vg_gate(...) set_baseline (seed) on the good page
+{"verdict": "PASS", "a11y": {"score": 100, "count": 0, "blocking": 0}, "visual": {...}}
+[3] vg_gate(...) on the SAME name after page changed
+{"verdict": "FAIL", "visual": {"changed_pixels": 7743, "ratio": 0.007562, "regions": [{"x": 16, "y": 112, "w": 320, "h": 80}, {"x": 16, "y": 48, "w": 224, "h": 48}]},
+ "a11y": {"passed": false, "score": 88, "count": 2, "blocking": 2,
+         "by_rule": {"1.4.3": 1, "1.1.1": 1},
+         "top": [{"rule": "1.4.3", "impact": "serious", "selector": "html > body > p.lead",
+                  "message": "Contrast 1.61:1 is below the 4.5:1 minimum for normal text",
+                  "data": {"ratio": 1.61, ...}},
+                 {"rule": "1.1.1", "impact": "serious", "selector": "html > body > div.row > img.avatar",
+                  "message": "Image has no alt attribute", "data": {...}}]}}
+[4] vg_a11y on the bad page
+{"score": 88, "count": 2, "blocking": 2, "by_rule": {"1.4.3": 1, "1.1.1": 1}, "stats": {"contrast_checked": 3, "text_nodes": 3, "images": 1, "headings": 1}}
+```
+
+Both numbers are real: a change a diff would call "noise" (0.76% of a page) is caught, and two genuine WCAG breaks are surfaced with exact ratios.
+
 ---
 
 ## The report
@@ -50,10 +71,12 @@ hermes plugins enable visual-gate
 
 `vg_doctor` tells you whether it can find Chrome and whether the probe works. Once a baseline exists, run:
 
-- `vg_gate name=home url=https://example.com --report` — the full verdict
+- `vg_gate name=home url=https://example.com --report` — the full verdict (ask the agent to run it; it is a registered tool, not a CLI command)
 - `vg_gate name=home url=https://example.com --set-baseline=true` — bless the current state
 - `vg_gate name=home url=https://example.com --skip-a11y` — visual only
 - `vg_gate name=home url=https://example.com --skip-visual` — accessibility only
+
+`vg_doctor` first. It launches Chrome, screenshots, and runs the probe — if nothing is found, run `hermes plugins validate` from the plugin root.
 
 ## How it captures
 
