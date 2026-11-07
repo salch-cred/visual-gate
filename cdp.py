@@ -43,6 +43,30 @@ class CDPError(RuntimeError):
     pass
 
 
+class NavigationError(CDPError):
+    """The page never really loaded: refused connection, DNS failure, or an HTTP error status."""
+
+
+# Stops animation for a stable screenshot. Finite animations jump to their end state so a fade-in
+# is captured visible; infinite ones rest on their first frame.
+_FREEZE_JS = r"""
+(() => {
+  const style = document.createElement('style');
+  style.setAttribute('data-visual-gate', 'freeze');
+  style.textContent = '*,*::before,*::after{transition:none!important;caret-color:transparent!important}';
+  (document.head || document.documentElement).appendChild(style);
+  for (const anim of document.getAnimations()) {
+    try {
+      const timing = anim.effect && anim.effect.getComputedTiming();
+      if (timing && timing.iterations !== Infinity && timing.endTime !== Infinity) anim.finish();
+      else { anim.pause(); anim.currentTime = 0; }
+    } catch (err) { /* a detached animation has nothing to freeze */ }
+  }
+  return 1;
+})()
+"""
+
+
 def find_chrome(explicit: str = "") -> Optional[str]:
     """Locate a usable Chromium-family binary, or None."""
     if explicit:
@@ -120,6 +144,7 @@ class _WS:
     def recv(self) -> str:
         while True:
             b0, b1 = self._recv_exact(2)
+            fin = b0 & 0x80
             opcode = b0 & 0x0F
             masked = b1 & 0x80
             length = b1 & 0x7F
@@ -140,10 +165,9 @@ class _WS:
                 continue
             if opcode in (0x1, 0x2, 0x0):
                 self._buf += payload
-                try:
-                    text = self._buf.decode("utf-8")
-                except UnicodeDecodeError:
-                    continue          # wait for the rest of a split frame
+                if not fin:
+                    continue          # a fragmented message ends on the frame with FIN set
+                text = self._buf.decode("utf-8")
                 self._buf = b""
                 return text
 
@@ -205,7 +229,10 @@ class Browser:
             "--hide-scrollbars",
             "--force-device-scale-factor=%s" % self.device_scale,
             f"--window-size={self.width},{self.height}",
+            "--disable-dev-shm-usage",
         ]
+        if os.name == "posix" and os.geteuid() == 0:
+            args.append("--no-sandbox")       # Chrome refuses to start as root, as in most containers
         if self.headless:
             args.append("--headless=new")
         args.append("about:blank")
@@ -221,6 +248,7 @@ class Browser:
         self._session = attached["sessionId"]
         self._call("Page.enable", {})
         self._call("Runtime.enable", {})
+        self._call("Network.enable", {})
         self._call("Emulation.setDeviceMetricsOverride", {
             "width": self.width, "height": self.height,
             "deviceScaleFactor": self.device_scale, "mobile": False,
@@ -290,7 +318,11 @@ class Browser:
         self._ws.send(json.dumps(message))
         deadline = time.time() + timeout
         while time.time() < deadline:
-            raw = self._ws.recv()
+            self._ws.sock.settimeout(max(0.1, deadline - time.time()))
+            try:
+                raw = self._ws.recv()
+            except socket.timeout:
+                break
             try:
                 msg = json.loads(raw)
             except ValueError:
@@ -299,13 +331,22 @@ class Browser:
                 if "error" in msg:
                     raise CDPError(f"{method}: {msg['error'].get('message')}")
                 return msg.get("result") or {}
-            if "method" in msg:
-                self._events.append(msg)
+            self._note_event(msg)
         raise CDPError(f"{method}: timed out after {timeout}s")
+
+    def _note_event(self, msg: dict) -> None:
+        """Keep only what navigation reads, so a chatty page cannot grow this list without bound."""
+        method = msg.get("method")
+        if method == "Page.loadEventFired":
+            self._events.append(msg)
+        elif method == "Network.responseReceived" and msg.get("params", {}).get("type") == "Document":
+            self._events.append(msg)
 
     def _drain_until(self, event: str, timeout: float = 30.0) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._ws:
+                self._ws.sock.settimeout(max(0.1, deadline - time.time()))
             for i, ev in enumerate(self._events):
                 if ev.get("method") == event:
                     return self._events.pop(i)
@@ -319,25 +360,46 @@ class Browser:
                 msg = json.loads(raw)
             except ValueError:
                 continue
-            if "method" in msg:
-                if msg["method"] == event:
-                    return msg
-                self._events.append(msg)
+            if msg.get("method") == event:
+                return msg
+            self._note_event(msg)
         raise CDPError(f"event {event} not seen within {timeout}s")
 
     # -- public ---------------------------------------------------------------
 
-    def navigate(self, url: str, *, wait: float = 0.35, settle: float = 0.9) -> None:
-        self._call("Page.navigate", {"url": url}, timeout=60)
+    def _document_status(self, frame_id: str) -> Optional[int]:
+        """HTTP status of the main document, or None for file:, data: and about: pages."""
+        status = None
+        for ev in self._events:
+            params = ev.get("params", {})
+            if ev.get("method") == "Network.responseReceived" and params.get("frameId") == frame_id:
+                status = (params.get("response") or {}).get("status")
+        return int(status) if status else None
+
+    def navigate(self, url: str, *, wait: float = 0.35, settle: float = 0.9,
+                 allow_error_status: bool = False, freeze: bool = True) -> Optional[int]:
+        """Load ``url`` and return its HTTP status. A page that failed to load raises, because
+        Chrome renders its own error page and that must never be judged as the user's page."""
+        self._events.clear()
+        started = self._call("Page.navigate", {"url": url}, timeout=60)
+        if started.get("errorText"):
+            raise NavigationError(f"could not load {url}: {started['errorText']}")
         try:
             self._drain_until("Page.loadEventFired", timeout=30)
         except CDPError:
             pass                              # a page that never fires load still renders
+        status = self._document_status(str(started.get("frameId") or ""))
+        if status and status >= 400 and not allow_error_status:
+            raise NavigationError(f"{url} answered HTTP {status}; set allow_error_status=true "
+                                  f"if this error page is what you mean to check")
         self.evaluate("document.fonts && document.fonts.ready ? "
                       "document.fonts.ready.then(()=>1) : 1", await_promise=True)
         time.sleep(max(0.0, wait))
+        if freeze:
+            self.evaluate(_FREEZE_JS)
         self.evaluate("window.scrollTo(0,0)")
         time.sleep(max(0.0, settle * 0.2))
+        return status
 
     def evaluate(self, expression: str, *, await_promise: bool = False,
                  timeout: float = 60.0) -> Any:

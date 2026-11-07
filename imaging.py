@@ -22,7 +22,8 @@ import numpy as np
 from PIL import Image
 
 MAX_SIDE = 4000          # guard against a 40k-pixel-tall page eating memory
-ALIGN_WINDOW = 4         # px searched in each direction
+ALIGN_WINDOW = 2         # px searched in each direction; a larger move is a layout change
+ALIGN_GAIN = 0.5         # a shift must at least halve the error to be believed
 
 
 @dataclass
@@ -117,27 +118,48 @@ def per_region_report(mask: np.ndarray, *, min_area: int = 12,
     return regions[:max_regions]
 
 
+def _overlap(a: np.ndarray, b: np.ndarray, dx: int, dy: int, step: int = 1
+             ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """The two regions that line up when ``b`` is moved by (dx, dy), sampled identically."""
+    h, w, _ = a.shape
+    rows, cols = h - abs(dy), w - abs(dx)
+    if rows < 8 or cols < 8:
+        return None
+    ya, yb = max(0, dy), max(0, -dy)
+    xa, xb = max(0, dx), max(0, -dx)
+    return (a[ya:ya + rows:step, xa:xa + cols:step],
+            b[yb:yb + rows:step, xb:xb + cols:step])
+
+
+def _score(a: np.ndarray, b: np.ndarray, dx: int, dy: int, step: int = 1) -> Optional[float]:
+    pair = _overlap(a, b, dx, dy, step)
+    return None if pair is None else float(np.abs(pair[0] - pair[1]).mean())
+
+
 def _best_offset(a: np.ndarray, b: np.ndarray, window: int) -> tuple[int, int]:
-    """Coarse alignment: compare a sparse sample of a at integer offsets of b."""
+    """Find a small shift of ``b`` that genuinely explains the difference, else (0, 0).
+
+    The search runs on a sparse sample for speed, then the winner has to beat "no shift" at full
+    resolution by ALIGN_GAIN. Without that proof, aligning unchanged images manufactures a diff.
+    """
+    baseline_score = _score(a, b, 0, 0)
+    if not baseline_score:              # None or exactly 0.0: nothing to explain
+        return (0, 0)
     h, w, _ = a.shape
     step = max(1, min(h, w) // 120)
-    sample_a = a[::step, ::step]
-    best = (0, 0, 1e18)
+    best = (0, 0)
+    best_score = float("inf")
     for dy in range(-window, window + 1):
         for dx in range(-window, window + 1):
-            y0, y1 = max(0, dy), min(h, h + dy)
-            x0, x1 = max(0, dx), min(w, w + dx)
-            if y1 - y0 < 8 or x1 - x0 < 8:
-                continue
-            sa = a[y0:y1:step, x0:x1:step]
-            sb = byslice = b[max(0, -dy):max(0, -dy) + sa.shape[0],
-                             max(0, -dx):max(0, -dx) + sa.shape[1]]
-            if byslice.shape != sa.shape:
-                continue
-            delta = float(np.abs(sa - sb).mean())
-            if delta < best[2]:
-                best = (dx, dy, delta)
-    return best[0], best[1]
+            score = _score(a, b, dx, dy, step)
+            if score is not None and score < best_score:
+                best, best_score = (dx, dy), score
+    if best == (0, 0):
+        return best
+    full = _score(a, b, best[0], best[1])
+    if full is None or full > baseline_score * ALIGN_GAIN:
+        return (0, 0)
+    return best
 
 
 def diff(baseline_png: bytes, actual_png: bytes, *, threshold: int = 12,
@@ -164,12 +186,10 @@ def diff(baseline_png: bytes, actual_png: bytes, *, threshold: int = 12,
         offset = _best_offset(a, b, ALIGN_WINDOW)
         dx, dy = offset
         if dx or dy:
-            h, w, _ = a.shape
-            shifted = np.full_like(b, 255)
-            y0, y1 = max(0, dy), min(h, h + dy)
-            x0, x1 = max(0, dx), min(w, w + dx)
-            shifted[y0:y1, x0:x1] = b[max(0, -dy):max(0, -dy) + (y1 - y0),
-                                      max(0, -dx):max(0, -dx) + (x1 - x0)]
+            # Start from ``a`` so the strip uncovered by the shift is not counted as a change.
+            shifted = a.copy()
+            target, source = _overlap(shifted, b, dx, dy)
+            target[...] = source
             b = shifted
 
     delta = np.abs(a - b).max(axis=2)
@@ -178,12 +198,13 @@ def diff(baseline_png: bytes, actual_png: bytes, *, threshold: int = 12,
     total = int(mask.size)
     ratio = changed / float(total) if total else 0.0
 
-    overlay = np.asarray(b_img.convert("RGB")).copy()
+    shown_base = b.astype(np.uint8)
+    overlay = shown_base.copy()
     overlay[mask] = np.array([255, 0, 90], dtype=np.uint8)
-    faded = (np.asarray(b_img.convert("RGB")).astype(np.float32) * 0.35 + 165).astype(np.uint8)
+    faded = (shown_base.astype(np.float32) * 0.35 + 165).astype(np.uint8)
     shown = np.where(mask[:, :, None], overlay, faded)
     buf = io.BytesIO()
-    Image.fromarray(shown, mode="RGB").save(buf, format="PNG", optimize=True)
+    Image.fromarray(shown).save(buf, format="PNG", optimize=True)
 
     return DiffResult(
         changed_pixels=changed,

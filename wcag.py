@@ -7,19 +7,23 @@ computed styles, then comes back as data.
 Checks implemented (WCAG 2.2 A/AA):
 
   1.4.3  contrast (minimum)        — computed foreground vs. effective background
-  1.4.11 non-text contrast         — interactive controls vs. their background
+  1.4.11 non-text contrast         — form controls with no visible boundary
   1.3.1  info and relationships    — inputs with no accessible name, buttons with no text
   2.4.4  link purpose              — links named only "click here" / "read more" / bare URL
   2.4.6  headings and labels       — heading level jumps (h1 -> h3), missing h1, multiple h1
-  2.4.3  focus order               — focusable elements hidden behind overflow/visibility
+  2.4.2  page titled               — the document has a non-empty title
+  2.4.3  focus order               — keyboard-reachable elements nobody can see
   4.1.2  name, role, value         — control roles without an accessible name
-  1.1.1  non-text content          — <img> without alt, decorative images with alt=""
+  1.1.1  non-text content          — <img> with no alt and no other accessible name
   3.3.2  labels or instructions    — form fields with placeholder-only labelling
+  3.1.1  language of page          — the document declares a language
   2.5.8  target size (minimum)     — clickable targets under 24x24 CSS px
 
 The contrast maths is the WCAG 2.x relative-luminance formula, including alpha
 compositing of both the text colour and every ancestor background, which is where
-most naive implementations get it wrong.
+most naive implementations get it wrong. Any CSS colour format is read through a canvas,
+so oklch(), lab() and color-mix() are measured rather than skipped. Text the probe cannot
+measure, such as text over an image, is returned as `unverified` and never counted as a pass.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import json
 # The probe returns plain JSON so the Python side never has to trust page objects.
 _PROBE_JS = r"""
 (() => {
-  const OUT = {url: location.href, title: document.title, violations: [], stats: {}};
+  const OUT = {url: location.href, title: document.title, violations: [], unverified: [], stats: {}};
   const CONTRAST_AA = __CONTRAST_AA__;   // WCAG AA threshold, set per invocation
   const MAX_TEXT_NODES = __MAX_TEXT_NODES__;   // contrast sample cap, set per invocation
   const seen = new Set();
@@ -41,34 +45,35 @@ _PROBE_JS = r"""
   };
 
   // ---------- colour helpers ----------
+  const canvasCtx = document.createElement('canvas').getContext('2d', {willReadFrequently: true});
+  const colorCache = new Map();
+  const viaCanvas = (raw) => {
+    // The browser's own parser handles every CSS colour syntax, present and future.
+    canvasCtx.canvas.width = canvasCtx.canvas.height = 1;
+    canvasCtx.clearRect(0, 0, 1, 1);
+    canvasCtx.fillStyle = 'rgba(0,0,0,0)';
+    canvasCtx.fillStyle = raw;
+    canvasCtx.fillRect(0, 0, 1, 1);
+    const d = canvasCtx.getImageData(0, 0, 1, 1).data;
+    return {r: d[0], g: d[1], b: d[2], a: d[3] / 255};
+  };
   const parseColor = (raw) => {
     if (!raw) return null;
     raw = String(raw).trim();
     if (raw === 'transparent') return {r:0,g:0,b:0,a:0};
-    let m = raw.match(/^rgba?\(([^)]+)\)$/i);
+    const m = raw.match(/^rgba?\(([^)]+)\)$/i);
     if (m) {
       const parts = m[1].split(/[,/\s]+/).filter(Boolean).map(Number);
-      return {r:parts[0]||0, g:parts[1]||0, b:parts[2]||0,
-              a: parts.length > 3 ? (isNaN(parts[3]) ? 1 : parts[3]) : 1};
-    }
-    m = raw.match(/^color\(srgb\s+([^)]+)\)$/i);
-    if (m) {
-      const p = m[1].split(/[\s/]+/).filter(Boolean).map(Number);
-      return {r:(p[0]||0)*255, g:(p[1]||0)*255, b:(p[2]||0)*255, a: p.length>3?p[3]:1};
-    }
-    if (raw.startsWith('#')) {
-      let h = raw.slice(1);
-      if (h.length === 3) h = h.split('').map(c => c + c).join('');
-      if (h.length === 8) {
-        return {r:parseInt(h.slice(0,2),16), g:parseInt(h.slice(2,4),16),
-                b:parseInt(h.slice(4,6),16), a:parseInt(h.slice(6,8),16)/255};
-      }
-      if (h.length === 6) {
-        return {r:parseInt(h.slice(0,2),16), g:parseInt(h.slice(2,4),16),
-                b:parseInt(h.slice(4,6),16), a:1};
+      if (parts.length >= 3 && parts.every(n => !isNaN(n))) {
+        return {r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1};
       }
     }
-    return null;
+    if (!colorCache.has(raw)) {
+      let parsed = null;
+      try { parsed = viaCanvas(raw); } catch (err) { parsed = null; }
+      colorCache.set(raw, parsed);
+    }
+    return colorCache.get(raw);
   };
 
   const over = (fg, bg) => {   // alpha-composite fg over opaque bg
@@ -93,14 +98,15 @@ _PROBE_JS = r"""
     let node = el;
     while (node && node.nodeType === 1) {
       const st = getComputedStyle(node);
-      const bg = parseColor(st.backgroundColor);
-      if (bg && bg.a > 0.001) layers.push(bg);
-      if (bg && bg.a >= 0.999) break;
+      // An image paints over the colour on the same element, so test it first: a gradient or
+      // photo means there is no single background to compute a ratio against.
       if (st.backgroundImage && st.backgroundImage !== 'none') {
-        // A gradient/photo means we cannot compute a reliable ratio.
         layers.push({unknown: true});
         break;
       }
+      const bg = parseColor(st.backgroundColor);
+      if (bg && bg.a > 0.001) layers.push(bg);
+      if (bg && bg.a >= 0.999) break;
       node = node.parentElement;
     }
     let acc = {r:255, g:255, b:255, a:1};
@@ -144,9 +150,61 @@ _PROBE_JS = r"""
 
   const visible = (el) => {
     const st = getComputedStyle(el);
-    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (Number(getComputedStyle(node).opacity) === 0) return false;
+    }
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
+  };
+
+  const textOf = (el) => (el.innerText || el.textContent || '').trim();
+
+  // The accessible-name sources that matter in practice, in the order browsers apply them.
+  const nameOf = (el) => {
+    const refs = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+    const viaRefs = refs.map(id => {
+      const target = document.getElementById(id);
+      return target ? (target.textContent || '').trim() : '';
+    }).join(' ').trim();
+    if (viaRefs) return viaRefs;
+    const aria = (el.getAttribute('aria-label') || '').trim();
+    if (aria) return aria;
+    if (el.labels) {
+      const viaLabel = Array.from(el.labels).map(textOf).join(' ').trim();
+      if (viaLabel) return viaLabel;
+    }
+    if (el.tagName === 'INPUT') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'submit') return (el.value || '').trim() || 'Submit';
+      if (type === 'reset') return (el.value || '').trim() || 'Reset';
+      if (type === 'button') return (el.value || '').trim();
+      if (type === 'image') return (el.getAttribute('alt') || '').trim();
+    } else if (el.tagName !== 'SELECT' && el.tagName !== 'TEXTAREA') {
+      const text = textOf(el);
+      if (text) return text;
+      for (const child of el.querySelectorAll('img[alt], [aria-label], svg title')) {
+        const label = child.tagName.toLowerCase() === 'title' ? child.textContent
+          : child.getAttribute('alt') || child.getAttribute('aria-label');
+        if ((label || '').trim()) return label.trim();
+      }
+    }
+    return (el.getAttribute('title') || '').trim();
+  };
+
+  // True when an image, video or canvas is painted behind this element's text.
+  const overMedia = (el) => {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
+    const stack = document.elementsFromPoint(x, y);
+    const at = stack.indexOf(el);
+    return at >= 0 && stack.slice(at + 1).some(n => /^(IMG|VIDEO|CANVAS|PICTURE)$/.test(n.tagName));
+  };
+
+  const srOnly = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width <= 1 || r.height <= 1;
   };
 
   const isText = (el) => {
@@ -161,47 +219,60 @@ _PROBE_JS = r"""
   const all = Array.from(document.body ? document.body.querySelectorAll('*') : []);
   W.elements = all.length;
 
-  const TEXT_SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','SVG','PATH','HEAD','META','LINK']);
-  let tested = 0;
+  const TEXT_SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HEAD','META','LINK']);
+  const candidates = [];
   for (const el of all) {
-    if (TEXT_SKIP.has(el.tagName)) continue;
-    if (!isText(el)) continue;
-    if (!visible(el)) continue;
-    if (tested >= MAX_TEXT_NODES) break;
+    if (TEXT_SKIP.has(el.tagName) || el instanceof SVGElement) continue;
+    if (!isText(el) || !visible(el) || srOnly(el)) continue;
+    // WCAG 1.4.3 exempts disabled controls.
+    if (el.closest('[disabled], [aria-disabled="true"]')) continue;
+    candidates.push({el, size: parseFloat(getComputedStyle(el).fontSize) || 16});
+  }
+  candidates.sort((a, b) => b.size - a.size);       // stable, so equal sizes keep page order
+  const unverified = (el, reason) => {
+    if (OUT.unverified.length < 40) OUT.unverified.push({selector: selectorOf(el), snippet: snippetOf(el), reason});
+  };
+  let tested = 0, checked = 0;
+  for (const {el} of candidates) {
+    if (tested >= MAX_TEXT_NODES) {
+      unverified(el, 'over the max_text_nodes sampling cap');
+      continue;
+    }
     tested++;
-
     const st = getComputedStyle(el);
     const fgRaw = parseColor(st.color);
-    const bg = effectiveBackground(el);
-    if (!fgRaw || !bg) continue;
+    const bg = overMedia(el) ? null : effectiveBackground(el);
+    if (!fgRaw || !bg) {
+      unverified(el, fgRaw ? 'text sits on an image or gradient' : 'unreadable colour ' + st.color);
+      continue;
+    }
+    checked++;
     const fg = over(fgRaw, bg);
     const sizePx = parseFloat(st.fontSize) || 16;
     const weight = Number(st.fontWeight) || 400;
     const large = sizePx >= 24 || (sizePx >= 18.66 && weight >= 700);
     const required = large ? 3.0 : CONTRAST_AA;
     const r = ratio(fg, bg);
-    W.contrast_checked = tested;
     if (r < required) {
-      push('1.4.3', r < required - 1.5 ? 'serious' : 'moderate', selectorOf(el), snippetOf(el),
+      push('1.4.3', 'serious', selectorOf(el), snippetOf(el),
         'Contrast ' + r.toFixed(2) + ':1 is below the ' + required + ':1 minimum for ' +
         (large ? 'large' : 'normal') + ' text',
         {ratio: Number(r.toFixed(2)), required, fontSize: sizePx, color: st.color,
          background: 'rgb(' + Math.round(bg.r) + ',' + Math.round(bg.g) + ',' + Math.round(bg.b) + ')'});
     }
   }
-  W.text_nodes = tested;
+  W.contrast_checked = checked;
+  W.text_nodes = candidates.length;
 
   // ---------- 1.1.1 images ----------
   let imgs = 0;
   for (const img of document.querySelectorAll('img')) {
     imgs++;
-    if (!img.hasAttribute('alt')) {
+    // alt="" is the correct way to mark a decorative image, so it is not a finding.
+    if (!img.hasAttribute('alt') && !nameOf(img) &&
+        !(img.getAttribute('aria-hidden') === 'true' || /^(presentation|none)$/.test(img.getAttribute('role') || ''))) {
       push('1.1.1', 'serious', selectorOf(img), snippetOf(img),
         'Image has no alt attribute', {src: (img.currentSrc || img.src || '').slice(0, 120)});
-    } else if (img.getAttribute('alt') === '' &&
-               !(img.getAttribute('aria-hidden') === 'true' || img.getAttribute('role') === 'presentation')) {
-      push('1.1.1', 'minor', selectorOf(img), snippetOf(img),
-        'Image has empty alt but is not marked decorative', {});
     }
   }
   W.images = imgs;
@@ -212,13 +283,7 @@ _PROBE_JS = r"""
   for (const el of controls) {
     if (el.type === 'hidden') continue;
     if (!visible(el)) continue;
-    const id = el.getAttribute('id');
-    const labelled = (id && document.querySelector('label[for="' + CSS.escape(id) + '"]')) ||
-                     el.closest('label') ||
-                     el.getAttribute('aria-label') ||
-                     el.getAttribute('aria-labelledby') ||
-                     el.getAttribute('title');
-    if (!labelled) {
+    if (!nameOf(el)) {
       const onlyPlaceholder = !!el.getAttribute('placeholder');
       push(onlyPlaceholder ? '3.3.2' : '1.3.1',
         'serious', selectorOf(el), snippetOf(el),
@@ -232,11 +297,7 @@ _PROBE_JS = r"""
   // ---------- 4.1.2 buttons and links without a name ----------
   for (const el of document.querySelectorAll('button, a[href], [role="button"]')) {
     if (!visible(el)) continue;
-    const name = (el.innerText || el.textContent || '').trim() ||
-                 el.getAttribute('aria-label') ||
-                 el.getAttribute('title') ||
-                 (el.querySelector('img[alt]') ? el.querySelector('img[alt]').alt : '');
-    if (!name) {
+    if (!nameOf(el)) {
       push('4.1.2', 'serious', selectorOf(el), snippetOf(el),
         'Interactive element has no accessible name', {});
     }
@@ -279,6 +340,8 @@ _PROBE_JS = r"""
   let small = 0;
   for (const el of document.querySelectorAll('a[href], button, input[type="checkbox"], input[type="radio"], [role="button"]')) {
     if (!visible(el)) continue;
+    // WCAG 2.5.8 exempts links inside a sentence.
+    if (el.tagName === 'A' && getComputedStyle(el).display === 'inline') continue;
     const r = el.getBoundingClientRect();
     if (r.width < 24 || r.height < 24) {
       small++;
@@ -292,38 +355,59 @@ _PROBE_JS = r"""
   W.small_targets = small;
 
   // ---------- 1.4.11 non-text contrast on controls ----------
-  let borderChecked = 0;
+  // Only controls that carry no text of their own need a visible boundary, and a border or a
+  // contrasting fill both provide one. Native checkboxes and radios are drawn by the browser.
+  let boundaryChecked = 0;
   for (const el of document.querySelectorAll('button, input, select, textarea, [role="button"]')) {
-    if (!visible(el)) continue;
-    if (borderChecked >= 80) break;
-    borderChecked++;
+    if (!visible(el) || el.disabled) continue;
+    if (boundaryChecked >= 80) break;
     const st = getComputedStyle(el);
-    const bgEl = parseColor(st.backgroundColor);
-    const parentBg = effectiveBackground(el.parentElement || el);
-    if (!bgEl || !parentBg || bgEl.a < 0.05) continue;
-    const composited = over(bgEl, parentBg);
-    const r = ratio(composited, parentBg);
-    if (r < 3.0) {
+    if (st.appearance !== 'none' && /^(checkbox|radio|range|color|file)$/.test(el.type || '')) continue;
+    if (/^(submit|reset|button|image)$/.test(el.type || '') && el.tagName === 'INPUT') continue;
+    if (el.tagName !== 'INPUT' && el.tagName !== 'SELECT' && el.tagName !== 'TEXTAREA' && textOf(el)) continue;
+    boundaryChecked++;
+    if (st.boxShadow && st.boxShadow !== 'none') continue;     // a shadow may be the boundary
+    const around = effectiveBackground(el.parentElement || el);
+    if (!around) continue;
+    const fill = parseColor(st.backgroundColor);
+    const fillRatio = fill ? ratio(over(fill, around), around) : 1;
+    const sides = ['Top', 'Right', 'Bottom', 'Left'];
+    const borderRatio = Math.max(...sides.map(side => {
+      if (parseFloat(st['border' + side + 'Width']) <= 0 || st['border' + side + 'Style'] === 'none') return 1;
+      const color = parseColor(st['border' + side + 'Color']);
+      return color ? ratio(over(color, around), around) : 1;
+    }));
+    if (Math.max(fillRatio, borderRatio) < 3.0) {
       push('1.4.11', 'moderate', selectorOf(el), snippetOf(el),
-        'Control background contrasts ' + r.toFixed(2) + ':1 with its surroundings, below 3:1',
-        {ratio: Number(r.toFixed(2))});
+        'Control boundary contrasts ' + Math.max(fillRatio, borderRatio).toFixed(2) + ':1 with its surroundings, below 3:1',
+        {ratio: Number(Math.max(fillRatio, borderRatio).toFixed(2))});
     }
   }
 
   // ---------- 2.4.3 focusable but hidden ----------
+  // display:none, visibility:hidden and type=hidden cannot take focus, so they are not findings.
+  // A native file, checkbox or radio input at opacity 0 is the usual custom-control pattern.
   let hiddenFocusable = 0;
   for (const el of document.querySelectorAll('a[href], button, input, select, textarea, [tabindex]')) {
-    if (el.disabled) continue;
+    if (el.disabled || el.type === 'hidden') continue;
     if (el.getAttribute('tabindex') === '-1') continue;
+    if (el.checkVisibility && !el.checkVisibility({checkVisibilityCSS: true})) continue;
+    if (el.closest('[inert]')) continue;
+    if (/^(file|checkbox|radio)$/.test(el.type || '')) continue;
     if (!visible(el)) {
       hiddenFocusable++;
       if (hiddenFocusable <= 10) {
         push('2.4.3', 'moderate', selectorOf(el), snippetOf(el),
-          'Element is focusable but not visible', {});
+          'Element takes keyboard focus but cannot be seen', {});
       }
     }
   }
   W.hidden_focusable = hiddenFocusable;
+
+  // ---------- page title ----------
+  if (!(document.title || '').trim()) {
+    push('2.4.2', 'moderate', 'head > title', '<title>', 'Page has no title', {});
+  }
 
   // ---------- language ----------
   if (!document.documentElement.getAttribute('lang')) {
@@ -360,6 +444,7 @@ def summarise(payload: dict) -> dict:
         "url": payload.get("url", ""),
         "title": payload.get("title", ""),
         "violations": violations,
+        "unverified": payload.get("unverified") or [],
         "count": len(violations),
         "by_rule": dict(sorted(by_rule.items(), key=lambda kv: -kv[1])),
         "by_impact": by_impact,
@@ -374,6 +459,7 @@ RULE_NAMES = {
     "1.3.1": "Info and relationships",
     "1.4.3": "Contrast (minimum)",
     "1.4.11": "Non-text contrast",
+    "2.4.2": "Page titled",
     "2.4.3": "Focus order",
     "2.4.4": "Link purpose",
     "2.4.6": "Headings and labels",

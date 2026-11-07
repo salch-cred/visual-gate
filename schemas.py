@@ -36,6 +36,14 @@ VG_CAPTURE = {
                         "description": "Extra settle time after load — raise it for animated pages."},
             "selector": {"type": "string",
                          "description": "Capture only this element (CSS selector) instead of the page."},
+            "threshold": {"type": "integer",
+                          "description": "Per-channel delta (0-255) counted as a change. Default from settings."},
+            "tolerance": {"type": "number",
+                          "description": "Fraction of changed pixels still passing. 0 means exact."},
+            "allow_error_status": {"type": "boolean", "default": False,
+                                   "description": "Audit a page that answers HTTP 4xx/5xx instead of "
+                                                  "failing. Off by default so an error page never "
+                                                  "becomes a baseline."},
             "report": {"type": "boolean", "default": True,
                        "description": "Write a self-contained HTML report and return its path."},
         },
@@ -48,8 +56,8 @@ VG_DIFF = {
     "description": (
         "Compare two images already on disk (PNG/JPG) and report the changed-pixel ratio plus every "
         "changed region. Use for screenshots taken outside Hermes, or to compare two captures "
-        "directly. Pixel alignment and an antialiasing threshold are applied so sub-pixel font "
-        "rendering does not read as a change."
+        "directly. A shift of up to 2 px is aligned and an antialiasing threshold is applied, so "
+        "rendering jitter does not read as a change."
     ),
     "parameters": {
         "type": "object",
@@ -83,6 +91,11 @@ VG_A11Y = {
             "url": {"type": "string", "description": "http(s) URL, file path or file:// URL."},
             "viewport": _VP,
             "wait_ms": {"type": "integer", "default": 350},
+            "name": {"type": "string", "description": "Label for the report."},
+            "allow_error_status": {"type": "boolean", "default": False,
+                                   "description": "Audit a page that answers HTTP 4xx/5xx instead of "
+                                                  "failing. Off by default so an error page never "
+                                                  "becomes a baseline."},
             "min_impact": {"type": "string", "enum": ["minor", "moderate", "serious", "critical"],
                            "description": "Only report findings at or above this impact."},
             "limit": {"type": "integer", "default": 60,
@@ -115,11 +128,16 @@ VG_GATE = {
             "skip_a11y": {"type": "boolean", "default": False,
                           "description": "Run only the visual half."},
             "tolerance": {"type": "number",
-                          "description": "Fraction of changed pixels still passing. Default from settings."},
+                          "description": "Fraction of changed pixels still passing. 0 means exact. "
+                                         "Default from settings."},
             "threshold": {"type": "integer", "description": "Per-channel change threshold."},
             "max_blocking": {"type": "integer", "default": 0,
                              "description": "How many serious+critical a11y findings are tolerated."},
             "wait_ms": {"type": "integer", "default": 350},
+            "allow_error_status": {"type": "boolean", "default": False,
+                                   "description": "Audit a page that answers HTTP 4xx/5xx instead of "
+                                                  "failing. Off by default so an error page never "
+                                                  "becomes a baseline."},
             "report": {"type": "boolean", "default": True},
         },
         "required": ["name", "url"],

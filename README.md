@@ -1,103 +1,87 @@
 # visual-gate
 
-**The UI gate for agent-made web work.** Screenshots a live page through a real Chrome, diffs it against a stored baseline, and audits it for WCAG 2.2 AA in the same render pass.
+**Your agent says the UI is fine. This checks.**
 
-```text
-hermes vg_gate name="checkout" url=https://store.internal/checkout
-→ PASS, changed 12px (0.001%), no serious accessibility findings
-```
+An agent edits CSS, the tests stay green, and a button has quietly moved off-screen. visual-gate gives Hermes a real browser to verify its own front-end work: it screenshots the page, compares it with a stored baseline, and audits WCAG 2.2 AA on the same render. One tool call returns PASS or FAIL with the reasons.
 
-It exists because nothing else sees what the agent broke: a unit test can't tell that a button moved off-screen, a diff library can't compute whether two fonts actually look the same, and a screenshot is just a picture. Here, because it is a real browser under your control.
+A prompt or a skill cannot do this. They can only ask the model to look at code. visual-gate measures the rendered page: real pixels, real computed styles.
 
----
-
-## What it does
+## Tools
 
 | Tool | What it does |
 |---|---|
-| `vg_gate` | One call: capture → diff → a11y → report. Returns PASS/FAIL with reasons and writes a self-contained HTML report. |
-| `vg_capture` | Shoot a baseline. Use `set_baseline=true` once (or after a redesign); omit it afterwards and it diffs live. |
-| `vg_diff` | Pixel-diff any two images on disk. |
-| `vg_a11y` | Runs ~14 real WCAG checks against computed styles: contrast, alt text, name/role, heading order, placeholder-only labels, focusable-but-hidden, link purpose, target size. |
-| `vg_baselines` | List / delete stored visual baselines. |
-| `vg_doctor` | Self-check: finds Chrome, launches, screenshots, runs the probe. Call this first when a capture fails. |
+| `vg_gate` | One call: capture, diff, accessibility audit, HTML report. Returns PASS/FAIL with reasons. |
+| `vg_capture` | Store a baseline, or compare against one. Supports capturing a single element by CSS selector. |
+| `vg_diff` | Compare two images already on disk. |
+| `vg_a11y` | Accessibility audit only, with a 0-100 score. |
+| `vg_baselines` | List or delete stored baselines. |
+| `vg_doctor` | Self-check: finds a browser, launches it, runs the audit probe. Run this first. |
 
-**The differentiator:** the accessibility engine is a real probe that runs inside the page and returns *computed* contrast ratios — full alpha compositing over every ancestor background, not a colour pallet guess. The a11y tooling exists in 1,063 catalog entries and essentially none of them compute it against the real DOM.
+These are agent tools, not CLI commands. Ask Hermes in plain language, for example "gate the checkout page at localhost:3000". Hermes loads them on demand through `tool_search`.
 
-### A real run (measured, self-hosted harness)
-
-```text
-$ python demo_harness.py
-[2] vg_gate(...) set_baseline (seed) on the good page
-{"verdict": "PASS", "a11y": {"score": 100, "count": 0, "blocking": 0}, "visual": {...}}
-[3] vg_gate(...) on the SAME name after page changed
-{"verdict": "FAIL", "visual": {"changed_pixels": 7743, "ratio": 0.007562, "regions": [{"x": 16, "y": 112, "w": 320, "h": 80}, {"x": 16, "y": 48, "w": 224, "h": 48}]},
- "a11y": {"passed": false, "score": 88, "count": 2, "blocking": 2,
-         "by_rule": {"1.4.3": 1, "1.1.1": 1},
-         "top": [{"rule": "1.4.3", "impact": "serious", "selector": "html > body > p.lead",
-                  "message": "Contrast 1.61:1 is below the 4.5:1 minimum for normal text",
-                  "data": {"ratio": 1.61, ...}},
-                 {"rule": "1.1.1", "impact": "serious", "selector": "html > body > div.row > img.avatar",
-                  "message": "Image has no alt attribute", "data": {...}}]}}
-[4] vg_a11y on the bad page
-{"score": 88, "count": 2, "blocking": 2, "by_rule": {"1.4.3": 1, "1.1.1": 1}, "stats": {"contrast_checked": 3, "text_nodes": 3, "images": 1, "headings": 1}}
-```
-
-Both numbers are real: a change a diff would call "noise" (0.76% of a page) is caught, and two genuine WCAG breaks are surfaced with exact ratios.
-
----
-
-## The report
-
-`vg_gate` writes a single file with no network dependency. Every finding is pinned to its CSS selector and the whole thing opens instantly:
-
-1. PASS/FAIL verdict and the one-line reasons
-2. Baseline vs. actual vs. highlighted-diff thumbnails
-3. Changed-region boxes with coordinates and pixel counts
-4. Accessibility score, per-rule tallies and every violation with data (ratio, target size, placeholder value, etc.)
-
-## How the diff is not a liar
-
-- **Alignment search** — the page shifts a pixel when a font finishes loading; we search a small integer window and align first, otherwise a font switch reads as a 40% regression.
-- **Per-channel threshold** — antialiasing deltas under the `threshold` setting are ignored.
-- **Cellular region grouping** — changed pixels are merged into boxes (`340×60 at (12, 8)`) instead of an uncommentable pixel count.
-
-## Install & run
+## Install
 
 ```bash
 hermes plugins install https://github.com/salch-cred/visual-gate
 hermes plugins enable visual-gate
 ```
 
-`vg_doctor` tells you whether it can find Chrome and whether the probe works. Once a baseline exists, run:
+You need Chrome, Edge or Chromium installed. There is no Node or Playwright dependency. Python dependencies are `Pillow` and `numpy`, both with upper bounds.
 
-- `vg_gate name=home url=https://example.com --report` — the full verdict (ask the agent to run it; it is a registered tool, not a CLI command)
-- `vg_gate name=home url=https://example.com --set-baseline=true` — bless the current state
-- `vg_gate name=home url=https://example.com --skip-a11y` — visual only
-- `vg_gate name=home url=https://example.com --skip-visual` — accessibility only
+## What the gate guarantees
 
-`vg_doctor` first. It launches Chrome, screenshots, and runs the probe — if nothing is found, run `hermes plugins validate` from the plugin root.
+**A page that did not load is an error, never a verdict.** Refused connections, DNS failures and HTTP 4xx/5xx responses return an error and write no baseline. Otherwise Chrome's own error page would be judged, and could be saved as your reference. Set `allow_error_status=true` if you really do want to audit an error page.
 
-## How it captures
+**Unchanged means unchanged.** A shift of up to 2 px is aligned only if it demonstrably explains the difference, by at least halving the error. Any larger move is reported as a real layout change. Animations are frozen before capture: finite ones are captured at their end state, infinite ones on their first frame.
 
-Chrome headless (or `-new`) is launched with `--remote-debugging-port=0`, CDP over its own WebSocket (hand-rolled; no Playwright/Node), Navigate → `/Page.captureScreenshot` (or `Page.getLayoutMetrics` for full page) → for a11y, a probe is `Runtime.evaluate`'d in the page and returns **real computed styles**, not a screenshot guess. If no browser is running, everything degrades gracefully to a usable error.
+**A check that could not run is not a pass.** Text over a photo or gradient has no single background colour, and text beyond the sampling cap is not examined. Those elements are listed as `unverified` and named in the reasons, so a person can look at them.
 
-Dependencies are `Pillow` and `numpy` only, both pinned with upper bounds.
+**Text below AA blocks the gate.** Any text under the required ratio is `serious`, including 4.3:1 against a 4.5:1 minimum. Ratios use real alpha compositing over ancestor backgrounds, and every CSS colour format is read through the browser's own parser, including `oklch()`, `lab()` and `color-mix()`.
+
+## Accessibility checks
+
+12 WCAG 2.2 A/AA criteria, measured in the live page: 1.1.1 alt text, 1.3.1 and 3.3.2 form labels, 1.4.3 text contrast, 1.4.11 control boundaries, 2.4.2 page title, 2.4.3 hidden focus targets, 2.4.4 link purpose, 2.4.6 heading structure, 2.5.8 target size, 3.1.1 page language, 4.1.2 accessible names.
+
+This is an automated audit, so it finds what can be measured. It does not replace testing with a screen reader, and passing it does not mean a page is fully WCAG conformant.
+
+## The report
+
+`vg_gate` writes one self-contained HTML file with no network dependency: verdict and reasons, baseline, actual and highlighted-diff images, changed regions with coordinates, the accessibility score, and every finding with its CSS selector.
 
 ## Settings
 
+Set under `plugins.entries.visual-gate.settings` in `config.yaml`.
+
 | Setting | Default | Meaning |
 |---|---|---|
-| `chrome_path` | `""` (auto-detect) | Path to Chrome/Edge/Chromium. Also `VISUAL_GATE_CHROME` env var. |
-| `threshold` | `12` | Per-channel delta counted as a change. Raise if font antialiasing false-positives. |
-| `tolerance` | `0.001` | Fraction of changed pixels still passing. |
-| `align` | `true` | Search small offsets before diffing (see above). |
-| `keep_shots` | `40` | Retain screenshots per baseline. |
+| `chrome_path` | `""` (auto-detect) | Path to Chrome, Edge or Chromium. `VISUAL_GATE_CHROME` also works. |
+| `threshold` | `12` | Per-channel delta (0-255) counted as a change. |
+| `tolerance` | `0.001` | Fraction of changed pixels still passing, so a small edit on a very tall page can pass. `0` means exact. |
+| `align` | `true` | Align a shift of up to 2 px when it explains the difference. |
+| `contrast_aa` | `4.5` | Contrast ratio required for normal-size text. |
+| `max_text_nodes` | `400` | Text elements contrast-checked, largest text first. The rest are `unverified`. |
+| `keep_shots` | `40` | Screenshots kept per baseline. |
+
+## What it touches
+
+- **Launches a local headless browser** with a temporary profile, which is removed afterwards. Under root, as in most containers, it passes `--no-sandbox` because Chrome will not start otherwise. Don't point a root-run gate at untrusted pages.
+- **Loads the URL you give it**, which runs that page's JavaScript. Loopback and private addresses are allowed because a local dev server is the main target. Cloud metadata endpoints and the sites in your Hermes website blocklist are refused, including after redirects.
+- **Can read local files**: `file://` URLs and paths are accepted so generated HTML can be checked, and `vg_diff` reads the two images you name. Finding snippets returned to the agent can include text from the page.
+- **Writes only** under `<hermes home>/plugin-data/visual-gate/`: baselines, screenshots and reports.
+- **Sends nothing anywhere.** There is no telemetry, and no third-party service is called.
+
+## How it captures
+
+Chrome runs headless and is driven over the DevTools Protocol by a small client built on the standard library (`cdp.py`). For the audit, a probe runs inside the page and returns computed styles as data (`wcag.py`).
 
 ## Development
 
 ```bash
-pytest              # smoke tests: capture, diff, a11y probe, render, gate
+pytest tests
 ```
 
-The probe and diff are easily unit-tested without a browser (rendered HTML fixtures go in `test/render`). The browser layer is isolated behind `cdp.py` so it can be swapped for Playwright later.
+The suite covers the diff engine without a browser, then runs end to end through real headless Chrome, skipping those tests if no browser is installed. It includes a case for each failure the gate must never repeat, and pages with valid markup that must stay clean.
+
+## License
+
+MIT

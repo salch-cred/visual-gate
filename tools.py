@@ -34,6 +34,14 @@ def _cfg(key: str, default: Any = None) -> Any:
     return _SETTINGS.get(key, default)
 
 
+def _num(args: dict, key: str, default: Any, cast: Any = float) -> Any:
+    """An explicit 0 is a real value, so this tests for None rather than truthiness."""
+    value = args.get(key)
+    if value is None:
+        value = _cfg(key, default) if key in ("threshold", "tolerance") else default
+    return cast(value)
+
+
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields}, ensure_ascii=False, default=str)
 
@@ -57,6 +65,35 @@ def normalise_url(raw: str) -> str:
     if url.startswith("localhost") or url[0].isdigit() and ":" in url:
         return "http://" + url
     return url
+
+
+def check_url(url: str) -> None:
+    """Apply the operator's Hermes URL rules, the same floor the built-in browser tools use.
+
+    Loopback and private hosts stay allowed because a local dev server is the main target. Only
+    http(s) URLs are judged; outside Hermes these helpers do not exist and nothing is enforced.
+    """
+    if not url.startswith(("http://", "https://")):
+        return
+    try:
+        from tools.url_safety import is_always_blocked_url
+        from tools.website_policy import check_website_access
+    except ImportError:
+        return
+    if is_always_blocked_url(url):
+        raise PermissionError("Blocked: URL targets a cloud metadata endpoint")
+    blocked = check_website_access(url)
+    if blocked:
+        raise PermissionError(blocked.get("message") or "Blocked by the website policy")
+
+
+def _open(browser: cdp.Browser, url: str, args: dict) -> None:
+    """Navigate, then re-check the final address so a redirect cannot step around the policy."""
+    check_url(url)
+    wait = _num(args, "wait_ms", 350, int)
+    browser.navigate(url, wait=max(0.0, wait / 1000.0),
+                     allow_error_status=bool(args.get("allow_error_status")))
+    check_url(str(browser.evaluate("location.href") or ""))
 
 
 def _viewport(args: dict) -> tuple[int, int, float]:
@@ -97,9 +134,9 @@ class Session:
             self._browser.__exit__(*exc)
 
 
-def _capture(browser: cdp.Browser, url: str, *, full_page: bool, wait_ms: int,
+def _capture(browser: cdp.Browser, url: str, args: dict, *, full_page: bool,
              selector: str = "") -> tuple[bytes, int, int]:
-    browser.navigate(url, wait=max(0.0, wait_ms / 1000.0))
+    _open(browser, url, args)
     if selector:
         clip = browser.evaluate(
             "(() => { const el = document.querySelector(%s); if (!el) return null;"
@@ -124,6 +161,9 @@ def _capture(browser: cdp.Browser, url: str, *, full_page: bool, wait_ms: int,
     return shot.png, shot.width, shot.height
 
 
+_IMPACT_ORDER = ["minor", "moderate", "serious", "critical"]
+
+
 def _audit(browser: cdp.Browser, min_impact: str = "minor") -> dict:
     raw = browser.evaluate(wcag.probe_js(contrast_aa=float(_cfg("contrast_aa", 4.5)),
                                           max_text_nodes=int(_cfg("max_text_nodes", 400))),
@@ -133,10 +173,10 @@ def _audit(browser: cdp.Browser, min_impact: str = "minor") -> dict:
     except (ValueError, TypeError):
         raise RuntimeError("the accessibility probe returned unreadable data")
     summary = wcag.summarise(payload)
-    order = ["minor", "moderate", "serious", "critical"]
-    floor = order.index(min_impact) if min_impact in order else 0
-    summary["violations"] = [v for v in summary["violations"]
-                             if order.index(v.get("impact", "minor")) >= floor]
+    floor = _IMPACT_ORDER.index(min_impact) if min_impact in _IMPACT_ORDER else 0
+    kept = [v for v in summary["violations"] if _IMPACT_ORDER.index(v["impact"]) >= floor]
+    kept.sort(key=lambda v: -_IMPACT_ORDER.index(v["impact"]))
+    summary["violations"] = kept
     return summary
 
 
@@ -150,13 +190,11 @@ def vg_capture(args: dict, **kwargs) -> str:
         width, height, scale = _viewport(args)
         set_baseline = bool(args.get("set_baseline"))
         full_page = bool(args.get("full_page"))
-        wait_ms = int(args.get("wait_ms") or 350)
         selector = str(args.get("selector") or "")
         started = time.time()
 
         with Session(width, height, scale) as browser:
-            png, px_w, px_h = _capture(browser, url, full_page=full_page,
-                                       wait_ms=wait_ms, selector=selector)
+            png, px_w, px_h = _capture(browser, url, args, full_page=full_page, selector=selector)
 
         prior = store.read_baseline(name)
         meta = {"url": url, "viewport": [width, height], "device_scale": scale,
@@ -179,10 +217,9 @@ def vg_capture(args: dict, **kwargs) -> str:
                        **({"replaced": True} if prior else {}))
 
         baseline_png, prior_meta = prior
-        result = imaging.diff(baseline_png, png,
-                              threshold=int(args.get("threshold") or _cfg("threshold", 12)),
+        result = imaging.diff(baseline_png, png, threshold=_num(args, "threshold", 12, int),
                               align=bool(_cfg("align", True)))
-        tolerance = float(args.get("tolerance") or _cfg("tolerance", 0.001))
+        tolerance = _num(args, "tolerance", 0.001)
         passed = result.ratio <= tolerance and not result.size_mismatch
         store.keep_shot(name, png, int(_cfg("keep_shots", 40)))
         elapsed = int((time.time() - started) * 1000)
@@ -229,9 +266,9 @@ def vg_diff(args: dict, **kwargs) -> str:
         started = time.time()
         result = imaging.diff(
             base_path.read_bytes(), act_path.read_bytes(),
-            threshold=int(args.get("threshold") or _cfg("threshold", 12)),
+            threshold=_num(args, "threshold", 12, int),
             align=bool(_cfg("align", True)))
-        tolerance = float(args.get("tolerance") or _cfg("tolerance", 0.001))
+        tolerance = _num(args, "tolerance", 0.001)
         passed = result.ratio <= tolerance and not result.size_mismatch
         elapsed = int((time.time() - started) * 1000)
         name = str(args.get("name") or base_path.stem)
@@ -268,7 +305,7 @@ def vg_a11y(args: dict, **kwargs) -> str:
         width, height, scale = _viewport(args)
         started = time.time()
         with Session(width, height, scale) as browser:
-            browser.navigate(url, wait=max(0.0, int(args.get("wait_ms") or 350) / 1000.0))
+            _open(browser, url, args)
             summary = _audit(browser, str(args.get("min_impact") or "minor"))
             shot = browser.screenshot()
         elapsed = int((time.time() - started) * 1000)
@@ -278,14 +315,15 @@ def vg_a11y(args: dict, **kwargs) -> str:
         if args.get("report", True):
             html = render.build(
                 name=str(args.get("name") or "a11y"), verdict="PASS" if summary["blocking"] == 0 else "FAIL",
-                url=url, reasons=[f"{summary['count']} violations, {summary['blocking']} serious or critical"],
+                url=url, reasons=[f"{summary['count']} violations, {summary['blocking']} serious or critical"]
+                + _unverified_note(summary),
                 diff=None, a11y=summary, baseline_png=None, actual_png=shot.png,
                 diff_png=None, viewport=(shot.width, shot.height), elapsed_ms=elapsed)
             report_path = str(store.write_report("a11y", html))
         return _ok(score=summary["score"], count=summary["count"],
                    blocking=summary["blocking"], by_rule=summary["by_rule"],
                    by_impact=summary["by_impact"], stats=summary["stats"],
-                   violations=findings, truncated=len(summary["violations"]) > limit,
+                   unverified=summary["unverified"], violations=findings, truncated=len(summary["violations"]) > limit,
                    elapsed_ms=elapsed, report=report_path or None)
     except Exception as exc:
         return _err(f"{type(exc).__name__}: {exc}", tool="vg_a11y")
@@ -293,7 +331,13 @@ def vg_a11y(args: dict, **kwargs) -> str:
 
 # ── vg_gate ────────────────────────────────────────────────────────────────────
 
-_IMPACT_ORDER = ["minor", "moderate", "serious", "critical"]
+def _unverified_note(summary: dict) -> list[str]:
+    """A check that could not run is not a pass, so the verdict has to say so."""
+    count = len(summary.get("unverified") or [])
+    if not count:
+        return []
+    return [f"Accessibility: {count} text element(s) could not be contrast-checked "
+            f"(image behind the text, or over the sampling cap); review those by eye"]
 
 
 def vg_gate(args: dict, **kwargs) -> str:
@@ -305,16 +349,13 @@ def vg_gate(args: dict, **kwargs) -> str:
         set_baseline = bool(args.get("set_baseline"))
         skip_visual = bool(args.get("skip_visual"))
         skip_a11y = bool(args.get("skip_a11y"))
-        wait_ms = int(args.get("wait_ms") or 350)
-        tolerance = float(args.get("tolerance") or _cfg("tolerance", 0.001))
-        threshold = int(args.get("threshold") or _cfg("threshold", 12))
+        tolerance = _num(args, "tolerance", 0.001)
+        threshold = _num(args, "threshold", 12, int)
         max_blocking = int(args.get("max_blocking") if args.get("max_blocking") is not None else 0)
 
         started = time.time()
         with Session(width, height, scale) as browser:
-            browser.navigate(url, wait=max(0.0, wait_ms / 1000.0))
-            png, px_w, px_h = _capture(browser, url, full_page=bool(args.get("full_page")),
-                                       wait_ms=wait_ms)
+            png, px_w, px_h = _capture(browser, url, args, full_page=bool(args.get("full_page")))
             a11y_summary = None
             if not skip_a11y:
                 a11y_summary = _audit(browser, "minor")
@@ -346,6 +387,9 @@ def vg_gate(args: dict, **kwargs) -> str:
                                f"({diff_result.ratio * 100:.3f}% > {tolerance * 100:.3f}% tolerance)")
             if visual_passed:
                 reasons.append("Visual: no change beyond tolerance")
+            if diff_result.offset != (0, 0):
+                reasons.append(f"Visual: compared after aligning by {diff_result.offset[0]:+d}, "
+                               f"{diff_result.offset[1]:+d} px; the whole page moved that far")
 
         a11y_passed = True
         if a11y_summary is not None:
@@ -353,13 +397,16 @@ def vg_gate(args: dict, **kwargs) -> str:
                         if v["impact"] in ("serious", "critical")]
             a11y_passed = len(blocking) <= max_blocking
             if blocking:
-                top = ", ".join(f"{r}×{c}" for r, c in
-                                list(a11y_summary["by_rule"].items())[:4])
+                tally: dict[str, int] = {}
+                for v in blocking:
+                    tally[v["rule"]] = tally.get(v["rule"], 0) + 1
+                top = ", ".join(f"{r}×{c}" for r, c in list(tally.items())[:4])
                 reasons.append(f"Accessibility: {len(blocking)} serious/critical "
                                f"(allowed {max_blocking}) — {top}")
             else:
                 reasons.append(f"Accessibility: no serious or critical findings "
                                f"(score {a11y_summary['score']}/100)")
+            reasons.extend(_unverified_note(a11y_summary))
 
         passed = visual_passed and a11y_passed
         store.keep_shot(name, png, int(_cfg("keep_shots", 40)))
@@ -387,6 +434,8 @@ def vg_gate(args: dict, **kwargs) -> str:
                 "ratio": round(diff_result.ratio, 6) if diff_result else 0.0,
                 "tolerance": tolerance,
                 "regions": [r.as_dict() for r in (diff_result.regions[:15] if diff_result else [])],
+                "compared": diff_result is not None,
+                "aligned_by": list(diff_result.offset) if diff_result else [0, 0],
                 "baseline_written": prior is None or set_baseline,
             },
             "a11y": None if a11y_summary is None else {
@@ -395,6 +444,7 @@ def vg_gate(args: dict, **kwargs) -> str:
                 "count": a11y_summary["count"],
                 "blocking": a11y_summary["blocking"],
                 "by_rule": a11y_summary["by_rule"],
+                "unverified": len(a11y_summary["unverified"]),
                 "top": a11y_summary["violations"][:12],
             },
             "pixels": [px_w, px_h],

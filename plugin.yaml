@@ -1,6 +1,5 @@
 name: visual-gate
-title: Visual Gate
-version: 1.0.0
+version: 1.1.0
 manifest_version: 2
 api_version: 1
 description: >-
@@ -15,7 +14,6 @@ license: MIT
 homepage: https://github.com/salch-cred/visual-gate
 tags: [testing, visual-regression, accessibility, wcag, browser, qa, css]
 requires_hermes: ">=0.23"
-category: tools
 
 provides_tools:
   - vg_capture
@@ -41,7 +39,7 @@ config_schema:
   align:
     type: bool
     default: true
-    description: Search a small pixel offset before diffing so sub-pixel layout jitter does not read as a change.
+    description: Align a shift of up to 2 px before diffing, only when that shift clearly explains the difference.
   contrast_aa:
     type: float
     default: 4.5
@@ -49,7 +47,7 @@ config_schema:
   max_text_nodes:
     type: int
     default: 400
-    description: Cap on elements sampled by the contrast check, largest first.
+    description: Cap on text elements contrast-checked, largest text first. Anything over the cap is reported as unverified.
   keep_shots:
     type: int
     default: 40

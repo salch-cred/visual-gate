@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 from . import wcag
 
+_IMPACTS = ("minor", "moderate", "serious", "critical")
+
 _CSS = """
 :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;
 --pass:#3fb950;--fail:#f85149;--warn:#d29922;--acc:#58a6ff}
@@ -149,18 +151,20 @@ def build(*, name: str, verdict: str, url: str, reasons: list[str],
             data = v.get("data") or {}
             extra = ""
             if "ratio" in data:
-                extra = f"ratio {data['ratio']}:1 (needs {data.get('required', '—')})"
+                extra = (f"ratio {html.escape(str(data['ratio']))}:1 "
+                         f"(needs {html.escape(str(data.get('required', '—')))})")
                 if data.get("color"):
                     extra += f" · {html.escape(str(data['color']))} on {html.escape(str(data.get('background','')))}"
             elif data.get("w") and data.get("h"):
-                extra = f"{data['w']}×{data['h']} px"
+                extra = f"{html.escape(str(data['w']))}×{html.escape(str(data['h']))} px"
             elif data.get("placeholder"):
                 extra = f"placeholder: {html.escape(str(data['placeholder']))}"
             elif data.get("href"):
                 extra = html.escape(str(data["href"]))
+            impact = v["impact"] if v["impact"] in _IMPACTS else "minor"
             v_rows += (
-                f"<tr><td><span class='sev {v['impact']}'>{v['impact']}</span></td>"
-                f"<td><b>{v['rule']}</b><br><span style='color:var(--mut);font-size:12px'>"
+                f"<tr><td><span class='sev {impact}'>{impact}</span></td>"
+                f"<td><b>{html.escape(str(v['rule']))}</b><br><span style='color:var(--mut);font-size:12px'>"
                 f"{html.escape(wcag.rule_name(v['rule']))}</span></td>"
                 f"<td>{html.escape(v['message'])}"
                 f"{f'<div class=note>{extra}</div>' if extra else ''}</td>"
@@ -170,8 +174,8 @@ def build(*, name: str, verdict: str, url: str, reasons: list[str],
                       "No WCAG A/AA violations detected in the audited checks.</td></tr>")
         by_rule = "".join(
             f"<tr><td><code>{html.escape(rule)}</code> {html.escape(wcag.rule_name(rule))}</td>"
-            f"<td>{count}</td></tr>" for rule, count in (a11y.get("by_rule") or {}).items())
-        stats = a11y.get("stats") or {}
+            f"<td>{int(count)}</td></tr>" for rule, count in (a11y.get("by_rule") or {}).items())
+        stats = {k: v if isinstance(v, int) else 0 for k, v in (a11y.get("stats") or {}).items()}
         a11y_block = f"""
 <h2>Accessibility — WCAG 2.2 AA</h2>
 <div class="grid">
@@ -187,6 +191,7 @@ def build(*, name: str, verdict: str, url: str, reasons: list[str],
       <dt>Images</dt><dd>{stats.get('images', 0)}</dd>
       <dt>Form controls</dt><dd>{stats.get('controls', 0)}</dd>
       <dt>Headings</dt><dd>{stats.get('headings', 0)}</dd>
+      <dt>Not checkable</dt><dd>{len(a11y.get('unverified') or [])}</dd>
     </dl>
   </div>
   <div class="card"><h3>By rule</h3>
@@ -226,7 +231,7 @@ def build(*, name: str, verdict: str, url: str, reasons: list[str],
 <footer>
   Baseline {html.escape(name)} updated {_fmt_ts(meta.get('updated_at'))} ·
   sha256 {(meta.get('sha256') or '—')[:16]} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} ·
-  visual-gate 1.0.0
+  visual-gate 1.1.0
 </footer>
 </div></body></html>"""
 
