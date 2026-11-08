@@ -12,7 +12,7 @@ A prompt or a skill cannot do this. They can only ask the model to look at code.
 |---|---|
 | `vg_gate` | One call: capture, diff, accessibility audit, HTML report. Returns PASS/FAIL with reasons. |
 | `vg_capture` | Store a baseline, or compare against one. Supports capturing a single element by CSS selector. |
-| `vg_diff` | Compare two images already on disk. |
+| `vg_diff` | Compare two images in the working directory or the plugin's own captures. |
 | `vg_a11y` | Accessibility audit only, with a 0-100 score. |
 | `vg_baselines` | List or delete stored baselines. |
 | `vg_doctor` | Self-check: finds a browser, launches it, runs the audit probe. Run this first. |
@@ -64,9 +64,9 @@ Set under `plugins.entries.visual-gate.settings` in `config.yaml`.
 
 ## What it touches
 
-- **Launches a local headless browser** with a temporary profile, which is removed afterwards. Under root, as in most containers, it passes `--no-sandbox` because Chrome will not start otherwise. Don't point a root-run gate at untrusted pages.
+- **Launches a local headless browser** with a temporary profile, which is removed afterwards. The browser gets a minimal environment (path, home, locale, temp and display variables, plus the system folders Windows needs), so provider API keys and other Hermes secrets never reach it. Under root, as in most containers, it passes `--no-sandbox` because Chrome will not start otherwise. Don't point a root-run gate at untrusted pages.
 - **Loads the URL you give it**, which runs that page's JavaScript. Loopback and private addresses are allowed because a local dev server is the main target. Cloud metadata endpoints and the sites in your Hermes website blocklist are refused, including after redirects.
-- **Can read local files**: `file://` URLs and paths are accepted so generated HTML can be checked, and `vg_diff` reads the two images you name. Finding snippets returned to the agent can include text from the page.
+- **Reads local pages only under strict rules.** A local `.html`, `.htm` or `.svg` page is accepted only if its real path is inside the session working directory and Hermes' own read guard allows it, the same check `read_file` uses, so `.env` files and Hermes credential stores are refused. Every `file://` load the page makes, iframes and images included, is held and refused unless it passes the same check. `vg_diff` accepts image files only, from the working directory or the plugin's own captures. Finding snippets returned to the agent can include text from the page.
 - **Writes only** under `<hermes home>/plugin-data/visual-gate/`: baselines, screenshots and reports.
 - **Sends nothing anywhere.** There is no telemetry, and no third-party service is called.
 

@@ -8,10 +8,12 @@ Hermes does not hand ``ctx`` to the handler.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import quote
+from typing import Any, Iterable, Optional
+from urllib.parse import quote, unquote, urlparse
+from urllib.request import url2pathname
 
 from . import cdp, imaging, render, store, wcag
 
@@ -50,29 +52,132 @@ def _err(message: str, **fields: Any) -> str:
     return json.dumps({"ok": False, "error": message, **fields}, ensure_ascii=False, default=str)
 
 
+# ── local file policy ──────────────────────────────────────────────────────────
+#
+# Page text and screenshots go back to the agent, so a local file must pass the same gate as
+# Hermes' own read_file, and only file types that are web pages may be rendered at all.
+
+PAGE_SUFFIXES = frozenset({".html", ".htm", ".svg"})
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+
+
+def session_cwd() -> Path:
+    """The session's working directory: the configured cwd, not the gateway's own directory."""
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+    except ImportError:                       # outside Hermes, as in the test suite
+        return Path.cwd().resolve()
+    return Path(resolve_agent_cwd()).resolve()
+
+
+def _hermes_read_block(path: str) -> Optional[str]:
+    try:
+        from agent.file_safety import get_read_block_error
+    except ImportError:
+        return None
+    return get_read_block_error(path)
+
+
+def _inside(path: Path, roots: Iterable[Path]) -> bool:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def check_local_file(raw: str, suffixes: frozenset, *, extra_roots: Iterable[Path] = ()) -> Path:
+    """Resolve a local path and refuse it unless it is a permitted file inside an allowed folder.
+
+    The Hermes read guard runs on the path as given and again on the real path, so neither a
+    relative path nor a symlink can reach a credential store or a .env file.
+    """
+    cwd = session_cwd()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = cwd / path
+    blocked = _hermes_read_block(str(path))
+    if blocked:
+        raise PermissionError(blocked)
+    try:
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise FileNotFoundError(f"file not found: {raw}") from None
+    blocked = _hermes_read_block(str(real))
+    if blocked:
+        raise PermissionError(blocked)
+    if not real.is_file():
+        raise PermissionError(f"not a file: {raw}")
+    if real.suffix.lower() not in suffixes:
+        allowed = ", ".join(sorted(suffixes))
+        raise PermissionError(f"refused {raw}: only {allowed} files are accepted here")
+    roots = [cwd] + [Path(r).resolve() for r in extra_roots]
+    if not _inside(real, roots):
+        raise PermissionError(f"refused {raw}: local files must be inside the session working "
+                              f"directory ({cwd})")
+    return real
+
+
+def file_url_path(url: str) -> str:
+    parsed = urlparse(url)
+    location = unquote(parsed.path)
+    if parsed.netloc and parsed.netloc != "localhost":
+        location = f"//{parsed.netloc}{location}"     # a UNC share, which the guard refuses
+    return url2pathname(location)
+
+
+def local_page_allowed(url: str) -> bool:
+    """For the browser's file:// request filter: may this local resource load?"""
+    try:
+        check_local_file(file_url_path(url), PAGE_SUFFIXES | IMAGE_SUFFIXES | _ASSET_SUFFIXES)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+# A local page may pull in its own stylesheets, scripts and fonts from the same folder.
+_ASSET_SUFFIXES = frozenset({".css", ".js", ".mjs", ".woff", ".woff2", ".ttf", ".otf", ".ico"})
+
+
 # ── input normalisation ─────────────────────────────────────────────────────────
 
+_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
+
+
 def normalise_url(raw: str) -> str:
-    """Accept a URL, a file path, a bare file:// string or a data: URL."""
+    """Accept http(s), data: and about:blank as given; a local page by path or file:// URL only
+    after check_local_file. Every other scheme is refused."""
     url = (raw or "").strip()
     if not url:
         raise ValueError("url is required")
-    if url.startswith(("http://", "https://", "file://", "data:", "about:")):
+    lowered = url.lower()
+    if lowered.startswith(("http://", "https://", "data:")) or lowered == "about:blank":
         return url
-    path = Path(url).expanduser()
-    if path.exists():
-        return path.resolve().as_uri()
-    if url.startswith("localhost") or url[0].isdigit() and ":" in url:
+    if lowered.startswith("file:"):
+        return check_local_file(file_url_path(url), PAGE_SUFFIXES).as_uri()
+    if lowered.startswith("localhost") or (url[0].isdigit() and ":" in url):
         return "http://" + url
+    scheme = _SCHEME.match(url)
+    if scheme and len(scheme.group(1)) > 1:       # one letter is a Windows drive, not a scheme
+        raise PermissionError(f"refused {url!r}: only http, https, data and local page URLs are supported")
+    local = Path(url).expanduser()
+    if (Path(url).suffix.lower() in PAGE_SUFFIXES or "/" in url or "\\" in url
+            or local.is_absolute() or (session_cwd() / local).exists()):
+        return check_local_file(url, PAGE_SUFFIXES).as_uri()
     return url
 
 
 def check_url(url: str) -> None:
     """Apply the operator's Hermes URL rules, the same floor the built-in browser tools use.
 
-    Loopback and private hosts stay allowed because a local dev server is the main target. Only
-    http(s) URLs are judged; outside Hermes these helpers do not exist and nothing is enforced.
+    Loopback and private hosts stay allowed because a local dev server is the main target. A
+    local page is held to check_local_file; outside Hermes the http(s) helpers do not exist.
     """
+    if url.lower().startswith("file:"):
+        check_local_file(file_url_path(url), PAGE_SUFFIXES)
+        return
     if not url.startswith(("http://", "https://")):
         return
     try:
@@ -126,7 +231,7 @@ class Session:
 
     def __enter__(self) -> "cdp.Browser":
         self._browser = cdp.Browser(_chrome(), width=self.width, height=self.height,
-                                    device_scale=self.scale)
+                                    device_scale=self.scale, file_guard=local_page_allowed)
         return self._browser.__enter__()
 
     def __exit__(self, *exc: Any) -> None:
@@ -258,11 +363,11 @@ def vg_capture(args: dict, **kwargs) -> str:
 
 def vg_diff(args: dict, **kwargs) -> str:
     try:
-        base_path = Path(str(args.get("baseline") or "")).expanduser()
-        act_path = Path(str(args.get("actual") or "")).expanduser()
-        for p, label in ((base_path, "baseline"), (act_path, "actual")):
-            if not p.is_file():
-                return _err(f"{label} image not found: {p}")
+        # The plugin's own captures are always allowed, so two stored screenshots can be compared.
+        base_path = check_local_file(str(args.get("baseline") or ""), IMAGE_SUFFIXES,
+                                     extra_roots=[store.root()])
+        act_path = check_local_file(str(args.get("actual") or ""), IMAGE_SUFFIXES,
+                                    extra_roots=[store.root()])
         started = time.time()
         result = imaging.diff(
             base_path.read_bytes(), act_path.read_bytes(),

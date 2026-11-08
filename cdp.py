@@ -20,7 +20,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -41,6 +41,22 @@ _CANDIDATES = [
 
 class CDPError(RuntimeError):
     pass
+
+
+# The browser gets only what it needs to start and draw. Everything else in the Hermes process
+# environment, provider API keys included, stays out of the child process.
+_ENV_KEEP = frozenset({
+    "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP",
+    "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+    # Windows locates its own system folders and the user profile through these.
+    "SYSTEMROOT", "WINDIR", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)",
+})
+
+
+def browser_env(source: Optional[dict] = None) -> dict:
+    source = os.environ if source is None else source
+    return {key: value for key, value in source.items() if key.upper() in _ENV_KEEP}
 
 
 class NavigationError(CDPError):
@@ -200,8 +216,10 @@ class Browser:
     """Context manager: launch Chrome headless, attach to one target, drive it."""
 
     def __init__(self, chrome: str, *, width: int = 1280, height: int = 800,
-                 device_scale: float = 1.0, headless: bool = True) -> None:
+                 device_scale: float = 1.0, headless: bool = True,
+                 file_guard: Optional[Callable[[str], bool]] = None) -> None:
         self.chrome = chrome
+        self.file_guard = file_guard
         self.width = width
         self.height = height
         self.device_scale = device_scale
@@ -212,6 +230,7 @@ class Browser:
         self._id = 0
         self._session: Optional[str] = None
         self._events: list[dict] = []
+        self.blocked_files: list[str] = []
 
     def __enter__(self) -> "Browser":
         self._profile = tempfile.mkdtemp(prefix="visual-gate-")
@@ -237,7 +256,7 @@ class Browser:
             args.append("--headless=new")
         args.append("about:blank")
         creation = 0x08000000 if os.name == "nt" else 0     # CREATE_NO_WINDOW
-        self._proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+        self._proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, env=browser_env(),
                                       stderr=subprocess.DEVNULL, creationflags=creation)
         port = self._wait_port()
         ws_url = self._browser_ws(port)
@@ -249,6 +268,9 @@ class Browser:
         self._call("Page.enable", {})
         self._call("Runtime.enable", {})
         self._call("Network.enable", {})
+        if self.file_guard is not None:
+            # Every file:// load, the page itself or anything it embeds, is held until judged.
+            self._call("Fetch.enable", {"patterns": [{"urlPattern": "file://*"}]})
         self._call("Emulation.setDeviceMetricsOverride", {
             "width": self.width, "height": self.height,
             "deviceScaleFactor": self.device_scale, "mobile": False,
@@ -337,10 +359,29 @@ class Browser:
     def _note_event(self, msg: dict) -> None:
         """Keep only what navigation reads, so a chatty page cannot grow this list without bound."""
         method = msg.get("method")
-        if method == "Page.loadEventFired":
+        if method == "Fetch.requestPaused":
+            self._judge_file_request(msg.get("params") or {})
+        elif method == "Page.loadEventFired":
             self._events.append(msg)
         elif method == "Network.responseReceived" and msg.get("params", {}).get("type") == "Document":
             self._events.append(msg)
+
+    def _judge_file_request(self, params: dict) -> None:
+        """Let a paused file:// request through only if the guard allows it. The reply is sent
+        without waiting for its acknowledgement, so it can be issued from inside another call."""
+        url = str((params.get("request") or {}).get("url") or "")
+        allowed = bool(self.file_guard and self.file_guard(url))
+        method = "Fetch.continueRequest" if allowed else "Fetch.failRequest"
+        payload: dict[str, Any] = {"requestId": params.get("requestId")}
+        if not allowed:
+            payload["errorReason"] = "AccessDenied"
+            self.blocked_files.append(url)
+        self._id += 1
+        message = {"id": self._id, "method": method, "params": payload}
+        if self._session:
+            message["sessionId"] = self._session
+        if self._ws:
+            self._ws.send(json.dumps(message))
 
     def _drain_until(self, event: str, timeout: float = 30.0) -> dict:
         deadline = time.time() + timeout

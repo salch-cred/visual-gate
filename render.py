@@ -231,7 +231,7 @@ def build(*, name: str, verdict: str, url: str, reasons: list[str],
 <footer>
   Baseline {html.escape(name)} updated {_fmt_ts(meta.get('updated_at'))} ·
   sha256 {(meta.get('sha256') or '—')[:16]} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} ·
-  visual-gate 1.1.0
+  visual-gate 1.1.1
 </footer>
 </div></body></html>"""
 
